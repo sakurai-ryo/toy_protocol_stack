@@ -8,7 +8,7 @@ const TCP_HEADER_SIZE: usize = 20;
 
 #[derive(Clone)]
 pub struct TCPPacket {
-    // バイト列の決められた箇所に値をセットすることでTCPセグメントになる
+    /// バイト列の決められた箇所に値をセットすることでTCPセグメントになる
     buffer: Vec<u8>,
 }
 
