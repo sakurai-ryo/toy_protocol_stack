@@ -52,7 +52,10 @@ impl Socket {
         tcp_packet.set_dest(self.remote_port);
         tcp_packet.set_flag(flag);
 
-        let sent_size = self.sender.send_to(tcp_packet.clone(), IpAddr::V4(self.remote_addr)).unwrap();
+        let sent_size = self
+            .sender
+            .send_to(tcp_packet.clone(), IpAddr::V4(self.remote_addr))
+            .unwrap();
         Ok(sent_size)
     }
 
