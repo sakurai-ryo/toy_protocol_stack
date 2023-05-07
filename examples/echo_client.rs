@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::{env, io, net::Ipv4Addr, str};
-use toy_protocol_stack::TCP;
+use toy_protocol_stack::tcp::TCP;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();

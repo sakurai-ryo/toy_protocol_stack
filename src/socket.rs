@@ -76,6 +76,22 @@ pub enum TcpStatus {
     LastAck,
 }
 
+impl Display for TcpStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            TcpStatus::Listen => write!(f, "LISTEN"),
+            TcpStatus::SynSent => write!(f, "SYNSENT"),
+            TcpStatus::SynRcvd => write!(f, "SYNRCVD"),
+            TcpStatus::Established => write!(f, "ESTABLISHED"),
+            TcpStatus::FinWait1 => write!(f, "FINWAIT1"),
+            TcpStatus::FinWait2 => write!(f, "FINWAIT2"),
+            TcpStatus::TimeWait => write!(f, "TIMEWAIT"),
+            TcpStatus::CloseWait => write!(f, "CLOSEWAIT"),
+            TcpStatus::LastAck => write!(f, "LASTACK"),
+        }
+    }
+}
+
 impl Socket {
     pub fn new(
         local_addr: Ipv4Addr,
@@ -126,12 +142,12 @@ impl Socket {
         tcp_packet.set_dest(self.remote_port);
         tcp_packet.set_seq(seq);
         tcp_packet.set_ack(ack);
-        tcp_packet.set_data_offset(5);
+        tcp_packet.set_data_offset(5); // 今回オプションフラグは使わないので固定
         tcp_packet.set_flag(flag);
         tcp_packet.set_window_size(self.recv_param.window);
         tcp_packet.set_payload(payload);
         tcp_packet.set_checksum(util::ipv4_checksum(
-            &tcp_packet.packet(),
+            tcp_packet.packet(),
             8,
             &[],
             &self.local_addr,
@@ -151,7 +167,6 @@ impl Socket {
             .push_back(RetransmissionQueueEntry::new(tcp_packet));
         Ok(sent_size)
     }
-
 
     pub fn get_sock_id(&self) -> SockID {
         SockID(

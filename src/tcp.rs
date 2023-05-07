@@ -20,17 +20,17 @@ const MSS: usize = 1460;
 const PORT_RANGE: Range<u16> = 40000..60000;
 
 #[derive(Debug, Clone, PartialEq)]
-struct TCPEvent {
-    sock_id: SockID, //イベント発生元のソケットID
-    kind: TCPEventKind,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub enum TCPEventKind {
     ConnectionCompleted,
     Acked,
     DataArrived,
     ConnectionClosed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TCPEvent {
+    sock_id: SockID, //イベント発生元のソケットID
+    kind: TCPEventKind,
 }
 
 impl TCPEvent {
@@ -41,7 +41,7 @@ impl TCPEvent {
 
 pub struct TCP {
     sockets: RwLock<HashMap<SockID, Socket>>,
-    event_condvar: (Mutex<Option<TCPEvent>>, Condvar),
+    event_condvar: (Mutex<Option<TCPEvent>>, Condvar), // TCPEventKindを他スレッドから受け取るまで待機するのに利用する条件変数
 }
 
 impl TCP {
@@ -146,12 +146,12 @@ impl TCP {
         self.wait_event(sock_id, TCPEventKind::ConnectionCompleted);
 
         let mut table = self.sockets.write().unwrap();
-        Ok(table
+        table
             .get_mut(&sock_id)
             .context(format!("no such socket: {:?}", sock_id))?
             .connected_connection_queue
             .pop_front()
-            .context("no connected socket")?)
+            .context("no connected socket")
     }
 
     /// 未使用のポート番号を探して返す
@@ -159,6 +159,8 @@ impl TCP {
         for _ in 0..(PORT_RANGE.end - PORT_RANGE.start) {
             let local_port = rng.gen_range(PORT_RANGE);
             let table = self.sockets.read().unwrap();
+
+            // SockIDは(local_addr, remote_addr, local_port, remote_port)となっているので'2'と比較する
             if table.keys().all(|k| local_port != k.2) {
                 return Ok(local_port);
             }
@@ -176,15 +178,20 @@ impl TCP {
             port,
             TcpStatus::SynSent,
         )?;
+
+        // 初期シーケンス番号は乱数にする（シーケンス番号予測攻撃のため）
         socket.send_param.initial_seq = rng.gen_range(1..1 << 31);
         socket.send_tcp_packet(socket.send_param.initial_seq, 0, tcpflags::SYN, &[])?;
         socket.send_param.unacked_seq = socket.send_param.initial_seq;
         socket.send_param.next = socket.send_param.initial_seq + 1;
+
+        // Socketsテーブルに対して、ロックの取得
         let mut table = self.sockets.write().unwrap();
         let sock_id = socket.get_sock_id();
         table.insert(sock_id, socket);
         // ロックを外してイベントの待機．受信スレッドがロックを取得できるようにするため．
         drop(table);
+
         self.wait_event(sock_id, TCPEventKind::ConnectionCompleted);
         Ok(sock_id)
     }
@@ -323,7 +330,8 @@ impl TCP {
         *event = None;
     }
 
-    /// 受信スレッド用の関数．
+    /// 受信スレッド用の関数
+    /// 受信したパケットヘッダを元にSocketsテーブルからSocketを取得しハンドラの実行を行う
     fn receive_handler(&self) -> Result<()> {
         dbg!("begin recv thread");
         let (_, mut receiver) = transport::transport_channel(
@@ -331,6 +339,7 @@ impl TCP {
             TransportChannelType::Layer3(IpNextHeaderProtocols::Tcp), // IPアドレスが必要なので，IPパケットレベルで取得．
         )
         .unwrap();
+
         let mut packet_iter = transport::ipv4_packet_iter(&mut receiver);
         loop {
             let (packet, remote_addr) = match packet_iter.next() {
@@ -347,12 +356,14 @@ impl TCP {
             };
             // pnetのTcpPacketからtcp::TCPPacketに変換する
             let packet = TCPPacket::from(tcp_packet);
+
             let remote_addr = match remote_addr {
                 IpAddr::V4(addr) => addr,
                 _ => {
                     continue;
                 }
             };
+
             let mut table = self.sockets.write().unwrap();
             let socket = match table.get_mut(&SockID(
                 local_addr,
@@ -375,6 +386,7 @@ impl TCP {
                 dbg!("invalid checksum");
                 continue;
             }
+
             let sock_id = socket.get_sock_id();
             if let Err(error) = match socket.status {
                 TcpStatus::Listen => self.listen_handler(table, sock_id, &packet, remote_addr),
@@ -393,7 +405,8 @@ impl TCP {
         }
     }
 
-    /// LISTEN状態のソケットに到着したパケットの処理
+    /// LISTEN状態のソケットに到着したパケットの処理。
+    /// TCPモジュールはリモートホストからのコネクション要求を待っている。パッシブオープンの後で入る状態と同じ。
     fn listen_handler(
         &self,
         mut table: RwLockWriteGuard<HashMap<SockID, Socket>>,
@@ -436,7 +449,8 @@ impl TCP {
         Ok(())
     }
 
-    /// SYNRCVD状態のソケットに到着したパケットの処理
+    /// SYNRCVD状態のソケットに到着したパケットの処理。
+    /// TCPモジュールは同期（SYN）セグメントを受信し、対応する同期（SYN/ACK）セグメントを送って、コネクション応答確認を待っている。
     fn synrcvd_handler(
         &self,
         mut table: RwLockWriteGuard<HashMap<SockID, Socket>>,
@@ -463,9 +477,14 @@ impl TCP {
         Ok(())
     }
 
-    /// SYNSENT状態のソケットに到着したパケットの処理
+    /// SYNSENT状態のソケットに到着したパケットの処理。
+    /// TCPモジュールは自分のコネクション要求の送信を終え、応答確認と対応するコネクション要求を待っている
     fn synsent_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
         dbg!("synsent handler");
+
+        // ACKとSYNビットが立っていること
+        // 確認応答番号が正しい範囲にいること
+        // （確認済みではない && 未送信ではない）
         if packet.get_flag() & tcpflags::ACK > 0
             && socket.send_param.unacked_seq <= packet.get_ack()
             && packet.get_ack() <= socket.send_param.next
@@ -515,7 +534,8 @@ impl TCP {
         }
     }
 
-    /// ESTABLISHED状態のソケットに到着したパケットの処理
+    /// ESTABLISHED状態のソケットに到着したパケットの処理。
+    /// コネクションが開かれ、データ転送が行える通常の状態になっている。受信されたデータは全てアプリケーションプロセスに渡せる。
     fn established_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
         dbg!("established handler");
         if socket.send_param.unacked_seq < packet.get_ack()
@@ -580,6 +600,9 @@ impl TCP {
         Ok(())
     }
 
+    /// CLOSEWAIT or LAST-ACK状態のソケットに到着したパケットの処理
+    /// TCPモジュールはアプリケーションプロセスからのコネクション終了要求を待っている。
+    /// リモートホストに送ったコネクション終了要求について、TCPモジュールがその応答確認を待っている
     fn close_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
         dbg!("closewait | lastack handler");
         socket.send_param.unacked_seq = packet.get_ack();
@@ -587,6 +610,8 @@ impl TCP {
     }
 
     /// FINWAIT1 or FINWAIT2状態のソケットに到着したパケットの処理
+    /// TCPモジュールはリモートホストからのコネクション終了要求か、すでに送った終了要求の応答確認を待っている。
+    /// この状態に入るのは、TCPモジュールがリモートホストからの終了要求を待っているときである。
     fn finwait_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
         dbg!("finwait handler");
         if socket.send_param.unacked_seq < packet.get_ack()
@@ -640,6 +665,14 @@ impl TCP {
 /// 宛先IPアドレスに対する送信元インタフェースのIPアドレスを取得する
 /// iproute2-ss180129で動作を確認．バージョンによって挙動が変わるかも
 fn get_source_addr_to(addr: Ipv4Addr) -> Result<Ipv4Addr> {
+    /*
+    ```sh
+    $ sudo ip netns exec host2 ip route get 10.0.0.1
+    10.0.0.1 via 10.0.1.254 dev host2-veth1 src 10.0.1.1 uid 0
+    cache
+    ```
+    コマンドを実行し、`src`の次にあるIPアドレスを取得する
+     */
     let output = Command::new("sh")
         .arg("-c")
         .arg(format!("ip route get {} | grep src", addr))
@@ -647,7 +680,7 @@ fn get_source_addr_to(addr: Ipv4Addr) -> Result<Ipv4Addr> {
     let mut output = str::from_utf8(&output.stdout)?
         .trim()
         .split_ascii_whitespace();
-    while let Some(s) = output.next() {
+    for s in output.by_ref() {
         if s == "src" {
             break;
         }
