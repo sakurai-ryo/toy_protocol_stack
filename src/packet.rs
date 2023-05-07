@@ -42,6 +42,7 @@ impl TCPPacket {
         }
     }
 
+    // network byte orderでbig endianと決まっているためfrom_be_bytesを利用
     pub fn get_src(&self) -> u16 {
         u16::from_be_bytes([self.buffer[0], self.buffer[1]])
     }
@@ -80,6 +81,7 @@ impl TCPPacket {
         u16::from_be_bytes([self.buffer[16], self.buffer[17]])
     }
 
+    // network byte orderでbig endianと決まっているためto_be_bytesを利用
     pub fn set_src(&mut self, port: u16) {
         self.buffer[0..2].copy_from_slice(&port.to_be_bytes())
     }
