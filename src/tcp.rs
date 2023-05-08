@@ -146,6 +146,8 @@ impl TCP {
         self.wait_event(sock_id, TCPEventKind::ConnectionCompleted);
 
         let mut table = self.sockets.write().unwrap();
+
+        // 受信スレッドのハンドラーがエンキューした接続済みSocketの取り出し
         table
             .get_mut(&sock_id)
             .context(format!("no such socket: {:?}", sock_id))?
@@ -169,11 +171,11 @@ impl TCP {
     }
 
     /// ターゲットに接続し，接続済みソケットのIDを返す
-    pub fn connect(&self, addr: Ipv4Addr, port: u16) -> Result<SockID> {
+    pub fn connect(&self, remote_addr: Ipv4Addr, port: u16) -> Result<SockID> {
         let mut rng = rand::thread_rng();
         let mut socket = Socket::new(
-            get_source_addr_to(addr)?,
-            addr,
+            get_source_addr_to(remote_addr)?,
+            remote_addr,
             self.select_unused_port(&mut rng)?,
             port,
             TcpStatus::SynSent,
@@ -181,6 +183,7 @@ impl TCP {
 
         // 初期シーケンス番号は乱数にする（シーケンス番号予測攻撃のため）
         socket.send_param.initial_seq = rng.gen_range(1..1 << 31);
+        // ACKフラグは0なので確認応答番号も0
         socket.send_tcp_packet(socket.send_param.initial_seq, 0, tcpflags::SYN, &[])?;
         socket.send_param.unacked_seq = socket.send_param.initial_seq;
         socket.send_param.next = socket.send_param.initial_seq + 1;
@@ -342,6 +345,7 @@ impl TCP {
 
         let mut packet_iter = transport::ipv4_packet_iter(&mut receiver);
         loop {
+            // IPパケットを取得
             let (packet, remote_addr) = match packet_iter.next() {
                 Ok((p, r)) => (p, r),
                 Err(_) => continue,
@@ -486,14 +490,15 @@ impl TCP {
         // 確認応答番号が正しい範囲にいること
         // （確認済みではない && 未送信ではない）
         if packet.get_flag() & tcpflags::ACK > 0
+            && packet.get_flag() & tcpflags::SYN > 0
             && socket.send_param.unacked_seq <= packet.get_ack()
             && packet.get_ack() <= socket.send_param.next
-            && packet.get_flag() & tcpflags::SYN > 0
         {
             socket.recv_param.next = packet.get_seq() + 1;
             socket.recv_param.initial_seq = packet.get_seq();
             socket.send_param.unacked_seq = packet.get_ack();
             socket.send_param.window = packet.get_window_size();
+
             if socket.send_param.unacked_seq > socket.send_param.initial_seq {
                 socket.status = TcpStatus::Established;
                 socket.send_tcp_packet(
