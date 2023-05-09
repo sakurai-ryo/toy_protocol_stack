@@ -68,6 +68,7 @@ impl TCP {
     /// 全てのソケットの再送キューを見て，タイムアウトしているパケットを再送する
     fn timer(&self) {
         dbg!("begin timer thread");
+
         loop {
             let mut table = self.sockets.write().unwrap();
             for (sock_id, socket) in table.iter_mut() {
@@ -77,6 +78,8 @@ impl TCP {
                     if socket.send_param.unacked_seq > item.packet.get_seq() {
                         // ackされてる
                         dbg!("successfully acked", item.packet.get_seq());
+
+                        // ACKされたデータの場合はそのデータ長分だけウィンドウサイズを増加させる
                         socket.send_param.window += item.packet.payload().len() as u16;
                         self.publish_event(*sock_id, TCPEventKind::Acked);
                         if item.packet.get_flag() & tcpflags::FIN > 0
@@ -87,14 +90,15 @@ impl TCP {
                         continue;
                     }
                     // タイムアウトを確認
+                    // 取り出したエントリがタイムアウトしてないなら，キューの以降のエントリもタイムアウトしてない
+                    // 先頭に戻す
                     if item.latest_transmission_time.elapsed().unwrap()
                         < Duration::from_secs(RETRANSMITTION_TIMEOUT)
                     {
-                        // 取り出したエントリがタイムアウトしてないなら，キューの以降のエントリもタイムアウトしてない
-                        // 先頭に戻す
                         socket.retransmission_queue.push_front(item);
                         break;
                     }
+
                     // ackされてなければ再送
                     if item.transmission_count < MAX_TRANSMITTION {
                         // 再送
@@ -206,7 +210,11 @@ impl TCP {
         let mut socket = table
             .get_mut(&sock_id)
             .context(format!("no such socket: {:?}", sock_id))?;
+
+        // データを受信すると、windowサイズが減るので、引くことで受信したデータ長がわかる
         let mut received_size = socket.recv_buffer.len() - socket.recv_param.window as usize;
+
+        // 受信バッファにデータが入り、windowサイズが減るまでループ
         while received_size == 0 {
             // ペイロードを受信 or FINを受信でスキップ
             match socket.status {
@@ -216,15 +224,21 @@ impl TCP {
             // ロックを外してイベントの待機．受信スレッドがロックを取得できるようにするため．
             drop(table);
             dbg!("waiting incoming data");
+
+            // 受信バッファ
             self.wait_event(sock_id, TCPEventKind::DataArrived);
+
             table = self.sockets.write().unwrap();
             socket = table
                 .get_mut(&sock_id)
                 .context(format!("no such socket: {:?}", sock_id))?;
             received_size = socket.recv_buffer.len() - socket.recv_param.window as usize;
         }
+
         let copy_size = cmp::min(buffer.len(), received_size);
         buffer[..copy_size].copy_from_slice(&socket.recv_buffer[..copy_size]);
+
+        // 受信バッファ内の値を0にリセットとwindowサイズを元に戻す
         socket.recv_buffer.copy_within(copy_size.., 0);
         socket.recv_param.window += copy_size as u16;
         Ok(copy_size)
@@ -234,20 +248,29 @@ impl TCP {
     /// 全て送信したら（まだackされてなくても）リターンする．
     pub fn send(&self, sock_id: SockID, buffer: &[u8]) -> Result<()> {
         let mut cursor = 0;
+
         while cursor < buffer.len() {
             let mut table = self.sockets.write().unwrap();
             let mut socket = table
                 .get_mut(&sock_id)
                 .context(format!("no such socket: {:?}", sock_id))?;
+
+            // 送信Windowサイズと残りデータサイズを比較
+            // その小さい方と最大セグメントサイズを比較し、小さい値を送信データ長とする
             let mut send_size = cmp::min(
                 MSS,
                 cmp::min(socket.send_param.window as usize, buffer.len() - cursor),
             );
+
+            // スライディングウィンドウ処理
             while send_size == 0 {
                 dbg!("unable to slide send window");
                 // ロックを外してイベントの待機．受信スレッドがロックを取得できるようにするため．
                 drop(table);
+
+                // ウィンドウ全てを消費した場合はACKが返るまで待機を行う
                 self.wait_event(sock_id, TCPEventKind::Acked);
+
                 table = self.sockets.write().unwrap();
                 socket = table
                     .get_mut(&sock_id)
@@ -258,6 +281,7 @@ impl TCP {
                     cmp::min(socket.send_param.window as usize, buffer.len() - cursor),
                 );
             }
+
             dbg!("current window size", socket.send_param.window);
             socket.send_tcp_packet(
                 socket.send_param.next,
@@ -268,6 +292,7 @@ impl TCP {
             cursor += send_size;
             socket.send_param.next += send_size as u32;
             socket.send_param.window -= send_size as u16;
+
             // 少しの間ロックを外して待機し，受信スレッドがACKを受信できるようにしている．
             // send_windowが0になるまで送り続け，送信がブロックされる確率を下げるため
             drop(table);
@@ -282,6 +307,8 @@ impl TCP {
         let mut socket = table
             .get_mut(&sock_id)
             .context(format!("no such socket: {:?}", sock_id))?;
+
+        // アクティブクローズ
         socket.send_tcp_packet(
             socket.send_param.next,
             socket.recv_param.next,
@@ -289,6 +316,7 @@ impl TCP {
             &[],
         )?;
         socket.send_param.next += 1;
+
         match socket.status {
             TcpStatus::Established => {
                 socket.status = TcpStatus::FinWait1;
@@ -525,10 +553,13 @@ impl TCP {
 
     fn delete_acked_segment_from_retransmission_queue(&self, socket: &mut Socket) {
         dbg!("ack accept", socket.send_param.unacked_seq);
+
         while let Some(item) = socket.retransmission_queue.pop_front() {
             if socket.send_param.unacked_seq > item.packet.get_seq() {
                 // ackされてるので除去
                 dbg!("successfully acked", item.packet.get_seq());
+
+                // ACKされている場合はウィンドウサイズをデータ長分だけ増加させる
                 socket.send_param.window += item.packet.payload().len() as u16;
                 self.publish_event(socket.get_sock_id(), TCPEventKind::Acked);
             } else {
@@ -543,22 +574,29 @@ impl TCP {
     /// コネクションが開かれ、データ転送が行える通常の状態になっている。受信されたデータは全てアプリケーションプロセスに渡せる。
     fn established_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
         dbg!("established handler");
+
+        // 送信済みデータに対する確認応答が返ってきた場合
         if socket.send_param.unacked_seq < packet.get_ack()
             && packet.get_ack() <= socket.send_param.next
         {
             socket.send_param.unacked_seq = packet.get_ack();
             self.delete_acked_segment_from_retransmission_queue(socket);
-        } else if socket.send_param.next < packet.get_ack() {
-            // 未送信セグメントに対するackは破棄
+        }
+        // 未送信セグメントに対するackは破棄
+        else if socket.send_param.next < packet.get_ack() {
             return Ok(());
         }
+
         if packet.get_flag() & tcpflags::ACK == 0 {
             // ACKが立っていないパケットは破棄
             return Ok(());
         }
+
         if !packet.payload().is_empty() {
-            self.process_payload(socket, &packet)?;
+            self.process_payload(socket, packet)?;
         }
+
+        // FINフラグが立っている場合
         if packet.get_flag() & tcpflags::FIN > 0 {
             socket.recv_param.next = packet.get_seq() + 1;
             socket.send_tcp_packet(
@@ -575,22 +613,28 @@ impl TCP {
 
     /// パケットのペイロードを受信バッファにコピーする
     fn process_payload(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
-        // バッファにおける読み込みのヘッド位置．
+        // バッファにおける読み込みのヘッド位置
+        // （受信バッファにあるデータ長） + （パケットのシーケンス番号 + 受信バッファにある最後のシーケンス番号）
         let offset = socket.recv_buffer.len() - socket.recv_param.window as usize
             + (packet.get_seq() - socket.recv_param.next) as usize;
+
         let copy_size = cmp::min(packet.payload().len(), socket.recv_buffer.len() - offset);
+
         socket.recv_buffer[offset..offset + copy_size]
             .copy_from_slice(&packet.payload()[..copy_size]);
+
         socket.recv_param.tail =
             cmp::max(socket.recv_param.tail, packet.get_seq() + copy_size as u32); // ロス再送の際穴埋めされるためにmaxをとる
 
+        // 順序入れ替わり無しの場合のみrecv_param.nextを進められる
         if packet.get_seq() == socket.recv_param.next {
-            // 順序入れ替わり無しの場合のみrecv_param.nextを進められる
             socket.recv_param.next = socket.recv_param.tail;
             socket.recv_param.window -= (socket.recv_param.tail - packet.get_seq()) as u16;
         }
+
         if copy_size > 0 {
             // 受信バッファにコピーが成功
+            // パケットの順番が入れかわっった際は前のパケットのシーケンス番号を確認応答番号として返す
             socket.send_tcp_packet(
                 socket.send_param.next,
                 socket.recv_param.next,
@@ -610,11 +654,12 @@ impl TCP {
     /// リモートホストに送ったコネクション終了要求について、TCPモジュールがその応答確認を待っている
     fn close_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
         dbg!("closewait | lastack handler");
+
         socket.send_param.unacked_seq = packet.get_ack();
         Ok(())
     }
 
-    /// FINWAIT1 or FINWAIT2状態のソケットに到着したパケットの処理
+    /// FINWAIT1 or FINWAIT2状態のソケットに到着したパケットの処理（アクティブクローズ）
     /// TCPモジュールはリモートホストからのコネクション終了要求か、すでに送った終了要求の応答確認を待っている。
     /// この状態に入るのは、TCPモジュールがリモートホストからの終了要求を待っているときである。
     fn finwait_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {

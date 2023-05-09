@@ -18,14 +18,14 @@ pub struct SockID(pub Ipv4Addr, pub Ipv4Addr, pub u16, pub u16);
 #[derive(Clone, Debug)]
 pub struct SendParam {
     pub unacked_seq: u32, // 送信後まだackされていないseqの先頭
-    pub next: u32,        // 次の送信
+    pub next: u32,        // 次の送信可能なseqの先頭
     pub window: u16,      // 送信ウィンドウサイズ
-    pub initial_seq: u32, // 初期送信seq
+    pub initial_seq: u32, // 初期送信seq番号
 }
 
 #[derive(Clone, Debug)]
 pub struct RecvParam {
-    pub next: u32,        // 次受信するseq
+    pub next: u32,        // 次受信するseqの先頭
     pub window: u16,      // 受信ウィンドウ
     pub initial_seq: u32, // 初期受信seq
     pub tail: u32,        // 受信seqの最後尾
@@ -34,8 +34,8 @@ pub struct RecvParam {
 #[derive(Clone, Debug)]
 pub struct RetransmissionQueueEntry {
     pub packet: TCPPacket,
-    pub latest_transmission_time: SystemTime,
-    pub transmission_count: u8,
+    pub latest_transmission_time: SystemTime, // 最後に送信された時間
+    pub transmission_count: u8,               // 送信回数
 }
 
 impl RetransmissionQueueEntry {
@@ -56,8 +56,8 @@ pub struct Socket {
     pub send_param: SendParam,
     pub recv_param: RecvParam,
     pub status: TcpStatus,
-    pub recv_buffer: Vec<u8>,
-    pub retransmission_queue: VecDeque<RetransmissionQueueEntry>,
+    pub recv_buffer: Vec<u8>, // 受信バッファを用意し、正しい順序のデータに並べ替える
+    pub retransmission_queue: VecDeque<RetransmissionQueueEntry>, // 再送信用セグメントを保存するキュー
     pub connected_connection_queue: VecDeque<SockID>, // 接続済みソケットを保持するキュー．リスニングソケットのみ使用．
     pub listening_socket: Option<SockID>, // 生成元のリスニングソケット．接続済みソケットのみ使用
     pub sender: TransportSender,
@@ -160,9 +160,13 @@ impl Socket {
             .context(format!("failed to send: \n{:?}", tcp_packet))?;
 
         dbg!("sent", &tcp_packet);
+
+        // 確認応答セグメント（payloadが無い && ACKセグメント）の場合は再送対象にはならない
         if payload.is_empty() && tcp_packet.get_flag() == tcpflags::ACK {
             return Ok(sent_size);
         }
+
+        // 再送に備えエンキューする
         self.retransmission_queue
             .push_back(RetransmissionQueueEntry::new(tcp_packet));
         Ok(sent_size)
