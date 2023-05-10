@@ -114,6 +114,8 @@ impl TCP {
                         break;
                     } else {
                         dbg!("reached MAX_TRANSMITTION");
+
+                        // パッシブクローズ時に送ったFIN|ACKに対してのACKが来ない場合はコネクションの切断を行う
                         if item.packet.get_flag() & tcpflags::FIN > 0
                             && (socket.status == TcpStatus::LastAck
                                 || socket.status == TcpStatus::FinWait1
@@ -216,7 +218,7 @@ impl TCP {
 
         // 受信バッファにデータが入り、windowサイズが減るまでループ
         while received_size == 0 {
-            // ペイロードを受信 or FINを受信でスキップ
+            // パッシブクローズ時にはデータ受信は行わない
             match socket.status {
                 TcpStatus::CloseWait | TcpStatus::LastAck | TcpStatus::TimeWait => break,
                 _ => {}
@@ -596,7 +598,7 @@ impl TCP {
             self.process_payload(socket, packet)?;
         }
 
-        // FINフラグが立っている場合
+        // FINフラグが立っている場合（パッシブクローズ）
         if packet.get_flag() & tcpflags::FIN > 0 {
             socket.recv_param.next = packet.get_seq() + 1;
             socket.send_tcp_packet(
@@ -649,7 +651,7 @@ impl TCP {
         Ok(())
     }
 
-    /// CLOSEWAIT or LAST-ACK状態のソケットに到着したパケットの処理
+    /// CLOSEWAIT or LAST-ACK状態のソケットに到着したパケットの処理（パッシブクローズ）
     /// TCPモジュールはアプリケーションプロセスからのコネクション終了要求を待っている。
     /// リモートホストに送ったコネクション終了要求について、TCPモジュールがその応答確認を待っている
     fn close_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
